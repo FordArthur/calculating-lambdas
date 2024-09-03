@@ -208,8 +208,8 @@ main = do
   hFlush stdout
   input <- getLine
   case parse expression "CmdLn" input of
-    (Right p) -> putStr "λ> " >> case fmap snd . evalStateT (algoW p) . TheContext (H.fromList [ ("eq", Scheme (S.fromList ["a"]) (Function (Variable "a") (Function (Variable "a") (Constant "Bool")))) ]) $ Variable "t0" of
-      (Right t) -> putStr "τ> " >> print t
-      (Left e)  -> putStr "!> " >> print e
-    (Left e)  -> putStr "!> " >> print e
+    (Right p) -> case fmap snd . evalStateT (algoW p) . TheContext (H.fromList [ ("eq", Scheme (S.fromList ["a"]) (Function (Variable "a") (Function (Variable "a") (Constant "Bool")))) ]) $ Variable "τ0" of
+      (Right t) -> putStr "σ> " >> print t
+      (Left e)  -> putStr "σ!> " >> print e
+    (Left e)  -> putStr "λ!> " >> print e
   main
