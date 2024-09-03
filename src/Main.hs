@@ -65,7 +65,12 @@ polyMap :: Subs -> PolyType -> PolyType
 polyMap (Subs m) (Scheme bounds' monoBounded') = Scheme bounds' $ typeMap (Subs $ m `H.difference` S.toMap bounds') monoBounded'
 
 compose :: Subs -> Subs -> Subs
-compose (Subs m1) (Subs m2) = Subs $ m1 `H.union` m2
+compose (Subs m1) (Subs m2)
+  = Subs $ H.foldMapWithKey (\t t' m -> H.alter (\case {
+      Nothing  -> Just t';
+      Just t''@(Variable v'') -> Just $ H.findWithDefault t'' v'' m;
+      Just t'' -> Just t''
+    }) t m) m1 m2
 
 newtype TypeError = TypeError { msg :: String }
 
@@ -146,7 +151,7 @@ freeInCtx :: TheContext -> S.HashSet String
 freeInCtx (TheContext ctx _) = foldl (\s p -> s `S.union` freeInType p) S.empty ctx
 
 unify :: MonoType -> MonoType -> Either TypeError Subs
-unify v@(Variable _)    v'@(Variable _) 
+unify v@(Variable _)    v'@(Variable _)
   | v == v'   = Right $ Subs H.empty
   | otherwise = Right $ singleMap v v'
 unify v@(Variable _)    t'
@@ -157,7 +162,7 @@ unify v@(Variable _)    t'
         isIn _  _                = False
 unify t                 v'@(Variable _)    = unify v' t
 unify (Constant i)      (Constant i')      = bool (Left $ TypeError "Type mismatch") (Right empty) (i == i')
-unify (Function tT rT)  (Function tT' rT') = unify tT tT' >>= \u -> (unify `on` typeMap u) rT rT'
+unify (Function tT rT)  (Function tT' rT') = unify tT tT' >>= \u -> compose u <$> (unify `on` typeMap u) rT rT'
 unify _                 _                  = Left $ TypeError "Type mismatch"
 
 algoW :: LambdaExpression -> StateT TheContext (Either TypeError) (Subs, MonoType)
@@ -203,6 +208,8 @@ main = do
   hFlush stdout
   input <- getLine
   case parse expression "CmdLn" input of
-    (Right p) -> putStr "λ> " >> print (fmap snd . evalStateT (algoW p) . TheContext H.empty $ Variable "t0")
+    (Right p) -> putStr "λ> " >> case fmap snd . evalStateT (algoW p) . TheContext (H.fromList [ ("eq", Scheme (S.fromList ["a"]) (Function (Variable "a") (Function (Variable "a") (Constant "Bool")))) ]) $ Variable "t0" of
+      (Right t) -> putStr "τ> " >> print t
+      (Left e)  -> putStr "!> " >> print e
     (Left e)  -> putStr "!> " >> print e
   main
