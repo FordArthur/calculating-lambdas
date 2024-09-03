@@ -1,11 +1,11 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE LambdaCase #-}
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 module Main where
 
 import System.IO
 import Text.Parsec
 import Data.Bool (bool)
-import Data.Functor
 import Data.Function (on)
 import Control.Lens
 import Control.Monad.State
@@ -30,13 +30,13 @@ data LambdaExpression =
   | Bind        { bName  :: String           , bExpr :: LambdaExpression }
 
 data MonoType =
-    Variable { identifier :: String   }
-  | Constant { constType  :: String   }
-  | Function { takesType  :: MonoType , retsType :: MonoType }
+    Variable { constraints :: S.HashSet String , identifier :: String   }
+  | Constant { constraints :: S.HashSet String , constType  :: String   }
+  | Function { takesType   :: MonoType         , retsType   :: MonoType }
   | Bottom -- for convenience
   deriving (Eq)
 
-data PolyType = Scheme { bounds :: S.HashSet String , monoBounded :: MonoType }
+data PolyType = Scheme { bounds :: H.HashMap String (S.HashSet String) , monoBounded :: MonoType }
 
 data TheContext = TheContext { _context  :: H.HashMap String PolyType , _typeGen :: MonoType }
 makeLenses ''TheContext
@@ -47,28 +47,28 @@ empty :: Subs
 empty = Subs H.empty
 
 genFrom :: MonoType -> MonoType
-genFrom (Variable (t:ns)) = Variable $ (t :) $ show $ (read :: String -> Int) ns + 1
+genFrom (Variable c (t:ns)) = Variable c $ (t :) $ show $ (read :: String -> Int) ns + 1
 genFrom _                 = undefined
 
 singleMap :: MonoType -> MonoType -> Subs
-singleMap (Variable n) = Subs . H.singleton n
-singleMap _            = undefined
+singleMap (Variable c n) (Variable c' n') = Subs . H.singleton n $ Variable (c `S.union` c') n'
+singleMap (Variable _ n) t                = Subs . H.singleton n $ t
+singleMap _              _                = undefined
 
 typeMap :: Subs -> MonoType -> MonoType
-typeMap s t@(Variable v)   = H.findWithDefault t v (_typeMap s)
+typeMap s t@(Variable _ v) = H.findWithDefault t v (_typeMap s)
 typeMap s (Function tT rT) = let m = typeMap s tT
                                  m' = typeMap s rT
                              in Function m m'
 typeMap _ t                = t
 
 polyMap :: Subs -> PolyType -> PolyType
-polyMap (Subs m) (Scheme bounds' monoBounded') = Scheme bounds' $ typeMap (Subs $ m `H.difference` S.toMap bounds') monoBounded'
+polyMap (Subs m) (Scheme bounds' monoBounded') = Scheme bounds' $ typeMap (Subs $ m `H.difference` bounds') monoBounded'
 
 compose :: Subs -> Subs -> Subs
-compose (Subs m1) (Subs m2)
-  = Subs $ H.foldMapWithKey (\t t' m -> H.alter (\case {
+compose (Subs m1) (Subs m2) = Subs $ H.foldMapWithKey (\t t' m -> H.alter (\case {
       Nothing  -> Just t';
-      Just t''@(Variable v'') -> Just $ H.findWithDefault t'' v'' m;
+      Just t''@(Variable _ v'') -> Just $ H.findWithDefault t'' v'' m;
       Just t'' -> Just t''
     }) t m) m1 m2
 
@@ -87,12 +87,15 @@ instance Show LambdaExpression where
 
 instance Show MonoType where
   show Bottom = ""
-  show (Constant c) = c
-  show (Variable n) = n
+  show (Constant _ c)   = c
+  show (Variable c n)   = '(' : n ++ " in " ++ show c ++ ")"
   show (Function t1 t2) = '(' : show t1 ++ " -> " ++ show t2 ++ ")"
 
 instance Show TypeError where
   show (TypeError e) = e
+
+instance Show Subs where
+  show (Subs m) = '{' : H.foldlWithKey (\s k t -> s ++ " " ++ k ++ " |-> "++ show t) "" m ++ " }"
 
 nat :: Parsec String () LambdaExpression
 nat = (`Cnst` Nat) <$> many1 digit
@@ -139,41 +142,55 @@ binds = do
 expression :: Parsec String () LambdaExpression
 expression = application <|> abstraction <|> binds <|> variable <|> constant
 
-freeInType :: PolyType -> S.HashSet String
-freeInType (Scheme bounds' monoBounded') = freeInType' monoBounded' `S.difference` bounds'
+freeInType :: PolyType -> H.HashMap String (S.HashSet String)
+freeInType (Scheme bounds' monoBounded') = freeInType' monoBounded' `H.difference` bounds'
   where
+    freeInType' :: MonoType -> H.HashMap String (S.HashSet String)
     freeInType' Bottom = undefined
-    freeInType' (Constant {}) = S.empty
-    freeInType' (Variable n) = S.singleton n
-    freeInType' (Function m1 m2) = freeInType' m1 `S.union` freeInType' m2
+    freeInType' (Constant {}) = H.empty
+    freeInType' (Variable c n) = H.singleton n c
+    freeInType' (Function m1 m2) = freeInType' m1 `H.union` freeInType' m2
 
-freeInCtx :: TheContext -> S.HashSet String
-freeInCtx (TheContext ctx _) = foldl (\s p -> s `S.union` freeInType p) S.empty ctx
+freeInCtx :: TheContext -> H.HashMap String (S.HashSet String)
+freeInCtx (TheContext ctx _) = foldl (\s p -> s `H.union` freeInType p) H.empty ctx
 
 unify :: MonoType -> MonoType -> Either TypeError Subs
-unify v@(Variable _)    v'@(Variable _)
-  | v == v'   = Right $ Subs H.empty
-  | otherwise = Right $ singleMap v v'
-unify v@(Variable _)    t'
+--
+unify v@(Variable c s)    v'@(Variable c' s')
+  | s == s'             = Right $ Subs H.empty
+  | c `S.isSubsetOf` c' = Right $ singleMap v v'
+  | otherwise           = Right $ singleMap v' v
+unify v@(Variable c _) t'@(Constant c' _)
+  | c `S.isSubsetOf` c' = Right $ singleMap v t'
+  | otherwise           = Left $ TypeError "Could not instantiate variable"
+unify v@(Variable _ _)    t'
   | v `isIn` t' = Left $ TypeError "Infinite type"
   | otherwise   = Right $ singleMap v t'
   where isIn v' (Function rT tT) = v' `isIn` rT || v' `isIn` tT
-        isIn v' v''@(Variable _) = v' == v''
+        isIn v' v''@(Variable _ _) = v' == v''
         isIn _  _                = False
-unify t                 v'@(Variable _)    = unify v' t
-unify (Constant i)      (Constant i')      = bool (Left $ TypeError "Type mismatch") (Right empty) (i == i')
+unify t                 v'@(Variable _ _)  = unify v' t
+unify (Constant _ i)    (Constant _ i')    = bool (Left $ TypeError "Type mismatch") (Right empty) (i == i')
 unify (Function tT rT)  (Function tT' rT') = unify tT tT' >>= \u -> compose u <$> (unify `on` typeMap u) rT rT'
 unify _                 _                  = Left $ TypeError "Type mismatch"
 
 algoW :: LambdaExpression -> StateT TheContext (Either TypeError) (Subs, MonoType)
 
-algoW (Cnst _  t) = return (empty, case t of { Nat -> Constant "Nat" })
+algoW (Cnst _  t) = return (empty, case t of { Nat -> Constant (S.singleton "Num") "Nat" })
 
 algoW (Var  n   ) = do
   ctx <- get
   (Scheme bounds' mono) <- lift . maybeToEither (TypeError "Could not find variable") . H.lookup n $ _context ctx
-  instMap <- foldM (\m t -> update (typeGen `over` genFrom) <&> ((m .) . typeMap . singleMap (Variable t) . _typeGen)) (typeMap empty) bounds'
+  instMap <- H.foldlWithKey instanceMap (return $ typeMap empty) bounds'
+  --update (typeGen `over` genFrom) <&> ((m .) . typeMap . singleMap (Variable t) . _typeGen)
   return (empty, instMap mono)
+  where
+    instanceMap :: StateT TheContext (Either TypeError) (MonoType -> MonoType) -> String -> S.HashSet String -> StateT TheContext (Either TypeError) (MonoType -> MonoType)
+    -- for some reason Haskell cannot infer this very easy to read, and easy to understand type
+    instanceMap mmap k c = do
+      map' <- mmap
+      nBeta <- identifier . _typeGen <$> update (typeGen `over` genFrom)
+      return $ (. map') $ typeMap $ singleMap (Variable c k) $ Variable c nBeta
 
 algoW (Application e1 e2) = do
   (s1, t1) <- algoW e1
@@ -185,7 +202,7 @@ algoW (Application e1 e2) = do
 
 algoW (Abstraction x e) = do
   beta <- _typeGen <$> update (typeGen `over` genFrom)
-  modify $ context `over` H.insert x (Scheme S.empty beta)
+  modify $ context `over` H.insert x (Scheme H.empty beta)
   (s1, t1) <- algoW e
   return (s1, Function (typeMap s1 beta) t1)
 
@@ -208,8 +225,16 @@ main = do
   hFlush stdout
   input <- getLine
   case parse expression "CmdLn" input of
-    (Right p) -> case fmap snd . evalStateT (algoW p) . TheContext (H.fromList [ ("eq", Scheme (S.fromList ["a"]) (Function (Variable "a") (Function (Variable "a") (Constant "Bool")))) ]) $ Variable "τ0" of
+    (Right p) -> case fmap snd . evalStateT (algoW p) . TheContext builtIn $ Variable S.empty "τ0" of
       (Right t) -> putStr "σ> " >> print t
       (Left e)  -> putStr "σ!> " >> print e
     (Left e)  -> putStr "λ!> " >> print e
   main
+  where
+    a = Variable S.empty "a"
+    s = Variable (S.singleton "Num") "s"
+    forAll vs = H.fromList $ map (\(Variable c n) -> (n, c)) vs
+    builtIn = H.fromList [
+        ("eq", Scheme (forAll [a]) (Function a (Function a a))),
+        ("inc", Scheme (forAll [s]) (Function s s))
+      ]
